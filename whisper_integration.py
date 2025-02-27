@@ -4,7 +4,7 @@ import torch
 import tempfile
 import ffmpeg
 import logging
-from datetime import timedelta
+from utils.formatters import EDLFormatter, SRTFormatter, MLTFormatter
 
 class WhisperTranscriber:
     def __init__(self, model_name="small", use_gpu=True, logger=None):
@@ -118,8 +118,8 @@ class WhisperTranscriber:
                 os.remove(output_path)
             raise
 
-    def process_video(self, video_path, output_dir=None, generate_edl=True, generate_srt=True, margin=1.0):
-        """動画を処理し、EDLとSRTファイルを生成します（エラーハンドリング強化版）"""
+    def process_video(self, video_path, output_dir=None, generate_edl=True, generate_srt=True, generate_mlt=False):
+        """動画を処理し、EDL、SRT、MLTファイルを生成します"""
         if not self.is_model_ready():
             self.wait_for_model()
 
@@ -143,7 +143,7 @@ class WhisperTranscriber:
                     audio_path,
                     language="ja",
                     task="transcribe",
-                    verbose=True,  # デバッグ用に詳細ログを有効化
+                    verbose=True,
                     initial_prompt=None,
                     condition_on_previous_text=False,
                     temperature=0.0,
@@ -169,31 +169,49 @@ class WhisperTranscriber:
             if not result or 'segments' not in result:
                 raise ValueError(f"音声認識結果が不正です: {video_path}")
 
-            # セグメントの前処理（無効なセグメントの除外）
+            # セグメントの前処理
             valid_segments = []
+            file_name = os.path.basename(video_path)
             for segment in result["segments"]:
                 if segment["end"] > segment["start"] and segment["text"].strip():
+                    segment["file_name"] = file_name
                     valid_segments.append(segment)
 
             self._log(f"\n有効なセグメント数: {len(valid_segments)}/{len(result['segments'])}")
 
             base_name = os.path.splitext(os.path.basename(video_path))[0]
+            edl_path = None
+            srt_path = None
+            mlt_path = None
             
             # EDLファイルの生成
             if generate_edl:
                 edl_path = os.path.join(output_dir, f"{base_name}.edl")
-                self._generate_edl(valid_segments, edl_path)
+                edl_content = EDLFormatter.generate(valid_segments, title=f"Transcription - {base_name}")
+                with open(edl_path, "w", encoding="utf-8") as f:
+                    f.write(edl_content)
                 self._log(f"EDLファイル生成完了: {edl_path}")
                 
             # SRTファイルの生成
             if generate_srt:
                 srt_path = os.path.join(output_dir, f"{base_name}.srt")
-                self._generate_srt(valid_segments, srt_path)
+                srt_content = SRTFormatter.generate(valid_segments, include_filename=True)
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(srt_content)
                 self._log(f"SRTファイル生成完了: {srt_path}")
                 
+            # MLTファイルの生成（単一ファイルの場合）
+            if generate_mlt:
+                mlt_path = os.path.join(output_dir, f"{base_name}.mlt")
+                mlt_content = MLTFormatter.generate({video_path: valid_segments})
+                with open(mlt_path, "w", encoding="utf-8") as f:
+                    f.write(mlt_content)
+                self._log(f"MLTファイル生成完了: {mlt_path}")
+                
             return {
-                "edl_path": edl_path if generate_edl else None,
-                "srt_path": srt_path if generate_srt else None,
+                "edl_path": edl_path,
+                "srt_path": srt_path,
+                "mlt_path": mlt_path,
                 "segments": valid_segments,
                 "text": result["text"],
                 "file_path": video_path
@@ -204,69 +222,9 @@ class WhisperTranscriber:
             raise
             
         finally:
-            # 一時ファイルの削除（デバッグ時はコメントアウト）
-            # if audio_path and os.path.exists(audio_path):
-            #     try:
-            #         os.remove(audio_path)
-            #         self._log(f"\n一時ファイル削除完了: {audio_path}")
-            #     except:
-            #         pass
             if self.device == "cuda":
                 torch.cuda.empty_cache()
                 self._log(f"GPUメモリ使用量（終了時）: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
-
-    def _generate_edl(self, segments, output_path):
-        """EDLファイルを生成します"""
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("TITLE: Audio Transcription\n")
-            f.write("FCM: NON-DROP FRAME\n\n")
-            
-            entry_count = 1
-            for segment in segments:
-                start_time = segment["start"]
-                end_time = segment["end"]
-                text = segment["text"].strip()
-                
-                # 開始時間と終了時間が同じ、またはテキストが空の場合はスキップ
-                if start_time >= end_time or not text:
-                    continue
-                    
-                start_tc = self._format_edl_timecode(start_time)
-                end_tc = self._format_edl_timecode(end_time)
-                
-                f.write(f"{entry_count:03d}  AX       AA/V  C        {start_tc} {end_tc}\n")
-                f.write(f"* FROM CLIP NAME: {text}\n\n")
-                entry_count += 1
-
-    def _format_edl_timecode(self, seconds):
-        """秒数をEDLタイムコード形式（HH:MM:SS:FF）に変換"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        frames = int((seconds % 1) * 24)  # 24fpsを想定
-        frames = min(frames, 23)  # フレーム数が24を超えないように制限
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}"
-
-    def _generate_srt(self, segments, output_path):
-        """SRTファイルを生成します"""
-        with open(output_path, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(segments, 1):
-                start_time = self._format_timestamp(segment["start"])
-                end_time = self._format_timestamp(segment["end"])
-                text = segment["text"].strip()
-                
-                f.write(f"{i}\n")
-                f.write(f"{start_time} --> {end_time}\n")
-                f.write(f"{text}\n\n")
-                
-    def _format_timestamp(self, seconds):
-        """秒数をSRT形式のタイムスタンプに変換します"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = seconds % 60
-        milliseconds = int((seconds % 1) * 1000)
-        seconds = int(seconds)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 # インスタンス生成（GPUモードをデフォルトに）
 transcriber = WhisperTranscriber(model_name="medium", use_gpu=True) 
