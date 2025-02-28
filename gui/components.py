@@ -35,23 +35,17 @@ class LogFrame(ttk.LabelFrame):
 class ProgressFrame(ttk.LabelFrame):
     def __init__(self, parent):
         super().__init__(parent, text='進捗状況', padding="5")
-        self.create_widgets()
-        
-    def create_widgets(self):
         self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(self, length=700, mode='determinate', variable=self.progress_var)
-        self.progress.grid(row=0, column=0, columnspan=3, pady=5)
+        self.progress_bar = ttk.Progressbar(
+            self, 
+            variable=self.progress_var,
+            maximum=100
+        )
+        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
-        self.progress_label = ttk.Label(self, text="0% 完了")
-        self.progress_label.grid(row=1, column=0, columnspan=3, pady=5)
-        
-        self.time_label = ttk.Label(self, text="処理時間: 0.00秒")
-        self.time_label.grid(row=2, column=0, columnspan=3, pady=5)
-        
-    def update_progress(self, progress, current_time):
+    def update_progress(self, progress):
         self.progress_var.set(progress)
-        self.progress_label.config(text=f"{progress:.1f}% 完了")
-        self.time_label.config(text=f"処理時間: {current_time:.2f}秒")
+        self.update()
 
 class OptionFrame(ttk.LabelFrame):
     def __init__(self, parent):

@@ -41,96 +41,98 @@ class VideoProcessor:
     def process_files(self, path, options, progress_callback, log_callback):
         try:
             self.processing = True
-            self.all_segments.clear()  # 初期化
+            self.cancel_flag = False
+            directory = path if os.path.isdir(path) else os.path.dirname(path)
             
+            # 結合ファイルのパスを設定
+            combined_edl = os.path.join(directory, 'combined.edl')
+            combined_srt = os.path.join(directory, 'combined.srt')
+            
+            # 既存のSRTファイルがない動画のみ文字起こしを実行
+            video_files = []
+            # 単一ファイルか確認
             if os.path.isfile(path):
-                log_callback(f'ファイル処理開始: {path}')
-                try:
-                    result = self.transcriber.process_video(
-                        path,
-                        generate_edl=options['generate_edl'],
-                        generate_srt=options['generate_srt'],
-                        generate_mlt=False  # 単一ファイルでは個別MLT不要
-                    )
-                    self.all_segments[path] = result["segments"]
-                    progress_callback(100, 0)
-                    log_callback(f'処理完了: {os.path.basename(path)}')
-                    if result['edl_path']:
-                        log_callback(f'EDLファイル生成: {result["edl_path"]}')
-                    if result['srt_path']:
-                        log_callback(f'SRTファイル生成: {result["srt_path"]}')
-                except Exception as e:
-                    log_callback(f'エラー - {os.path.basename(path)}: {str(e)}', level=logging.ERROR)
-                    
+                video_files = [Path(path)]
+                log_callback(f"単一ファイルモード: {path}")
             else:
-                video_files = []
-                for ext in ['.mp4', '.mov', '.avi']:
-                    video_files.extend(Path(path).glob(f'*{ext}'))
+                video_files = list(Path(directory).glob('*.mp4')) + list(Path(directory).glob('*.mov')) + list(Path(directory).glob('*.avi'))
+                log_callback(f"フォルダモード: {directory} ({len(video_files)}ファイル)")
+            
+            videos_needing_transcription = [
+                video for video in video_files 
+                if not video.with_suffix('.srt').exists() or options.get('force_transcribe', False)
+            ]
+            
+            if videos_needing_transcription:
+                total_files = len(videos_needing_transcription)
+                for i, video_file in enumerate(videos_needing_transcription):
+                    if self.cancel_flag:
+                        log_callback("処理がキャンセルされました")
+                        break
                     
-                total_files = len(video_files)
-                log_callback(f'フォルダ内の動画ファイル数: {total_files}')
-                
-                max_workers = min(self.max_workers, 2)
-                processed_files = 0
-                failed_files = []
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_file = {
-                        executor.submit(
-                            self.process_single_file,
+                    progress = (i / total_files) * 50
+                    progress_callback(progress)
+                    
+                    log_callback(f"文字起こし中 ({i+1}/{total_files}): {video_file.name}")
+                    
+                    try:
+                        result = self.transcriber.process_video(
                             str(video_file),
-                            options
-                        ): video_file
-                        for video_file in video_files
-                    }
-                    
-                    for future in concurrent.futures.as_completed(future_to_file):
-                        if not self.processing:
-                            executor.shutdown(wait=False)
-                            break
-                            
-                        video_file = future_to_file[future]
-                        try:
-                            result = future.result()
-                            processed_files += 1
-                            progress = (processed_files / total_files) * 100
-                            
-                            if result['success']:
-                                log_callback(f'処理完了 ({processed_files}/{total_files}): {video_file.name}')
-                                self.all_segments[str(video_file)] = result['result']['segments']
-                                if result['result']['edl_path']:
-                                    log_callback(f'EDLファイル生成: {result["result"]["edl_path"]}')
-                                if result['result']['srt_path']:
-                                    log_callback(f'SRTファイル生成: {result["result"]["srt_path"]}')
-                            else:
-                                failed_files.append((video_file.name, result['error']))
-                                log_callback(f'エラー - {video_file.name}: {result["error"]}', level=logging.ERROR)
-                                
-                            progress_callback(progress, 0)
-                            
-                        except Exception as e:
-                            processed_files += 1
-                            failed_files.append((video_file.name, str(e)))
-                            log_callback(f'エラー - {video_file.name}: {str(e)}', level=logging.ERROR)
-                            
-                if failed_files:
-                    log_callback("\n処理に失敗したファイル:", level=logging.WARNING)
-                    for file_name, error in failed_files:
-                        log_callback(f"- {file_name}: {error}", level=logging.WARNING)
+                            generate_edl=options['generate_edl'],
+                            generate_srt=options['generate_srt'],
+                            generate_mlt=False
+                        )
+                    except Exception as e:
+                        log_callback(f"エラー: {video_file.name} - {str(e)}")
+                        continue
+            else:
+                log_callback("全ての動画にSRTファイルが存在します。文字起こしをスキップします。")
+                progress_callback(50)
+            
+            if not self.cancel_flag:
+                # EDLファイルの結合
+                log_callback("EDLファイルを結合中...")
+                progress_callback(75)
+                if self.combine_files_by_extension(directory, 'edl', combined_edl):
+                    log_callback(f"EDLファイルを結合: {combined_edl}")
+                else:
+                    log_callback("警告: 結合可能なEDLファイルが見つかりませんでした")
                 
-                # 全動画のMLT生成
-                if options.get('generate_mlt', False) and self.all_segments:
-                    output_dir = path
-                    mlt_path = os.path.join(output_dir, "combined.mlt")
-                    mlt_content = MLTFormatter.generate(self.all_segments)
-                    with open(mlt_path, "w", encoding="utf-8") as f:
-                        f.write(mlt_content)
-                    log_callback(f"結合MLTファイル生成完了: {mlt_path}")
-                        
-        finally:
+                # SRTファイルの結合
+                log_callback("SRTファイルを結合中...")
+                progress_callback(90)
+                if self.combine_files_by_extension(directory, 'srt', combined_srt):
+                    log_callback(f"SRTファイルを結合: {combined_srt}")
+                else:
+                    log_callback("警告: 結合可能なSRTファイルが見つかりませんでした")
+                
+                progress_callback(100)
+                log_callback("すべての処理が完了しました")
+            
             self.processing = False
-            progress_callback(0, 0)
-            log_callback('処理が完了しました')
+            
+        except Exception as e:
+            log_callback(f"エラーが発生しました: {str(e)}")
+            self.processing = False
+            raise
+            
+    def combine_files_by_extension(self, directory, extension, output_path):
+        """指定された拡張子のファイルを結合"""
+        import os
+        
+        files = list(Path(directory).glob(f'*.{extension}'))
+        if not files:
+            return False
+            
+        with open(output_path, 'w', encoding='utf-8') as outfile:
+            for file in files:
+                if file.name != os.path.basename(output_path):  # 結合先ファイルを除外
+                    with open(file, 'r', encoding='utf-8') as infile:
+                        outfile.write(f"# {file.name}\n")
+                        outfile.write(infile.read())
+                        outfile.write("\n\n")
+        return True
             
     def cancel(self):
+        self.cancel_flag = True
         self.processing = False 
